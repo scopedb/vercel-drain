@@ -1,0 +1,52 @@
+# Copyright 2026 ScopeDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: v_vercel_requests
+comment: Flattened Vercel HTTP request, edge cache, function execution, and trace metrics
+statement: |
+  FROM scopedb.public.vercel_events
+  WHERE event_type = 'vercel.request'
+  SELECT
+      occurred_at,
+      service,
+      outcome,
+      level,
+      method,
+      host,
+      path,
+      status,
+      request_id,
+      message,
+      attributes['project_id']::string AS project_id,
+      attributes['deployment_id']::string AS deployment_id,
+      attributes['environment']::string AS environment,
+      attributes['branch']::string AS branch,
+      attributes['source']::string AS source,
+      attributes['route']::string AS route,
+      attributes['entrypoint']::string AS entrypoint,
+      attributes['region']::string AS region,
+      attributes['execution_region']::string AS execution_region,
+      attributes['vercel_cache']::string AS vercel_cache,
+      attributes['duration_ms']::float AS duration_ms,
+      attributes['trace_id']::string AS trace_id,
+      attributes['span_id']::string AS span_id,
+      attributes['user_agent']::string AS user_agent,
+      attributes['referer_host']::string AS referer_host,
+      attributes['referer_path']::string AS referer_path,
+      attributes['utm_source']::string AS utm_source,
+      attributes['utm_medium']::string AS utm_medium,
+      attributes['utm_campaign']::string AS utm_campaign,
+      attributes['utm_term']::string AS utm_term,
+      attributes['utm_content']::string AS utm_content,
+      attributes['ref']::string AS ref

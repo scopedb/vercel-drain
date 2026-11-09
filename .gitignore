@@ -1,0 +1,11 @@
+node_modules/
+dist-test/
+dist-worker/
+.wrangler/
+.vercel/
+.env
+.env.*
+!.env.example
+.dev.vars
+*.log
+.DS_Store

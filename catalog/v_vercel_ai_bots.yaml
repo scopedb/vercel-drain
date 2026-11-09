@@ -1,0 +1,39 @@
+# Copyright 2026 ScopeDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: v_vercel_ai_bots
+comment: Vercel HTTP requests from AI crawlers, coding agents, and Markdown/llms.txt readers
+statement: |
+  FROM scopedb.public.vercel_events
+  WHERE event_type = 'vercel.request'
+  SELECT
+      occurred_at,
+      service,
+      outcome,
+      method,
+      host,
+      path,
+      status,
+      request_id,
+      attributes['environment']::string AS environment,
+      attributes['region']::string AS region,
+      attributes['vercel_cache']::string AS vercel_cache,
+      attributes['user_agent']::string AS user_agent,
+      attributes['referer_host']::string AS referer_host
+  WHERE path = '/llms.txt'
+     OR ends_with(path, '.md')
+     OR regexp_like(
+         user_agent,
+         regex => '(?i)(ClaudeBot|Claude-Web|Claude-User|Anthropic|GPTBot|ChatGPT-User|OAI-SearchBot|Codex|Cursor|PerplexityBot|Perplexity-User|CCBot|Google-Extended|Applebot-Extended|Bytespider|Amazonbot|cohere-ai|YouBot)'
+     )

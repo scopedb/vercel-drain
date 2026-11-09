@@ -1,0 +1,34 @@
+{
+  "name": "vercel-drain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vercel Drain receiver and Next.js telemetry template for streaming Vercel Logs, Web Analytics, and Speed Insights into ScopeDB",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scopedb/vercel-drain.git"
+  },
+  "homepage": "https://www.scopedb.io",
+  "bugs": {
+    "url": "https://github.com/scopedb/vercel-drain/issues"
+  },
+  "scripts": {
+    "build:test": "node -e \"require('node:fs').rmSync('dist-test', { recursive: true, force: true })\" && tsc -p tsconfig.test.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build:test && node --test dist-test/test/*.test.js",
+    "ci": "pnpm test && pnpm run check"
+  },
+  "dependencies": {
+    "scopedb": "^0.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.8.2",
+    "yaml": "^2.9.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.32.1"
+}
