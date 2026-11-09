@@ -21,7 +21,7 @@ flowchart LR
 
 - **Unified Vercel Drains support**: Normalizes Vercel Log Drains (`vercel.request` and `vercel.log`), Web Analytics Drains (`vercel.pageview` and `vercel.custom_event`), and Speed Insights Drains (`vercel.web_vital`) into a single `scopedb.public.vercel_events` table.
 - **Verified webhook security**: Handles Vercel's `x-vercel-verify` handshake and verifies `x-vercel-signature` (`HMAC-SHA1`) using the Web Crypto API (`crypto.subtle.verify`) or a Bearer token (`DRAIN_AUTH_TOKEN`).
-- **Safe by default**: Sensitive URL query strings, URL fragments, and `Referer` query strings are stripped by default, retaining only standard `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, and `ref` attribution keys (plus any custom query keys explicitly allowlisted via `SCOPEDB_ALLOWED_QUERY_PARAMS`).
+- **Structured URL & attribution extraction**: Parses URL path, query object (`attributes['query']`), `Referer` host/path (stripping `Referer` query strings and fragments), and standard `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, and `ref` attribution keys.
 - **Portable Web Fetch handler**: Runs in a Next.js App Router Route Handler (`app/api/vercel-drain/route.ts`), a standalone Vercel Function, or a Cloudflare Worker with zero Node.js compatibility polyfills.
 
 ## 3-step quickstart
@@ -61,18 +61,16 @@ export const POST = handler;
 
 Configure the environment variables in your deployment:
 
-| Variable                        | Required | Default         | Description                                                                                      |
-| ------------------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------ |
-| `SCOPEDB_ENDPOINT`              | Yes      | —               | ScopeDB Cloud workspace endpoint (for example, `https://<id>.scopedb.cloud`)                     |
-| `SCOPEDB_API_KEY`               | Yes      | —               | ScopeDB workspace API key with append access to the target table                                 |
-| `VERCEL_DRAIN_SECRET`           | Yes*     | —               | Vercel Drain Signing Secret used to verify `x-vercel-signature` (`HMAC-SHA1`)                    |
-| `DRAIN_AUTH_TOKEN`              | Yes*     | —               | Optional Bearer token alternative if authenticating via `Authorization: Bearer <token>`          |
-| `VERCEL_VERIFY_TOKEN`           | No       | —               | Optional verification challenge echoed in `x-vercel-verify`                                      |
-| `SCOPEDB_DATABASE`              | No       | `scopedb`       | Target database name                                                                             |
-| `SCOPEDB_SCHEMA`                | No       | `public`        | Target schema name                                                                               |
-| `SCOPEDB_TABLE`                 | No       | `vercel_events` | Target table name                                                                                |
-| `SCOPEDB_ALLOWED_QUERY_PARAMS`  | No       | —               | Comma-separated allowlist of extra URL query keys stored under `attributes.query`                |
-| `SCOPEDB_REDACT_PATH_PREFIXES`  | No       | —               | Comma-separated URL path prefixes whose next segment is redacted to `:redacted`                  |
+| Variable               | Required | Default         | Description                                                                             |
+| ---------------------- | -------- | --------------- | --------------------------------------------------------------------------------------- |
+| `SCOPEDB_ENDPOINT`     | Yes      | —               | ScopeDB Cloud workspace endpoint (for example, `https://<id>.scopedb.cloud`)            |
+| `SCOPEDB_API_KEY`      | Yes      | —               | ScopeDB workspace API key with append access to the target table                        |
+| `VERCEL_DRAIN_SECRET`  | Yes*     | —               | Vercel Drain Signing Secret used to verify `x-vercel-signature` (`HMAC-SHA1`)           |
+| `DRAIN_AUTH_TOKEN`     | Yes*     | —               | Optional Bearer token alternative if authenticating via `Authorization: Bearer <token>` |
+| `VERCEL_VERIFY_TOKEN`  | No       | —               | Optional verification challenge echoed in `x-vercel-verify`                             |
+| `SCOPEDB_DATABASE`     | No       | `scopedb`       | Target database name                                                                    |
+| `SCOPEDB_SCHEMA`       | No       | `public`        | Target schema name                                                                      |
+| `SCOPEDB_TABLE`        | No       | `vercel_events` | Target table name                                                                       |
 
 ### 3. Connect Vercel Drains or Next.js `after()`
 

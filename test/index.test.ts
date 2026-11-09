@@ -72,7 +72,7 @@ describe("vercel-drain", () => {
     assert.equal(await verifyVercelSignature(rawBytes, validSig, "wrong-secret"), false);
   });
 
-  it("normalizes Log Drains, Web Analytics Drains, and Speed Insights Drains while redacting sensitive URLs", async () => {
+  it("normalizes Log Drains, Web Analytics Drains, and Speed Insights Drains into ScopeDB rows", async () => {
     const ingestedBatches: { url: string; headers: Headers; rows: Record<string, unknown>[] }[] = [];
 
     const handler = createVercelDrainHandler({
@@ -115,7 +115,7 @@ describe("vercel-drain", () => {
           timestamp: 1730620800000,
           method: "POST",
           host: "acme.example.com",
-          path: "/reset-password/secret_reset_token_999?utm_source=github&utm_medium=readme&ref=oss&tenant=acme&secret=top_secret",
+          path: "/api/chat?utm_source=github&utm_medium=readme&ref=oss&tenant=acme",
           statusCode: 504,
           region: "sfo1",
           vercelCache: "MISS",
@@ -135,7 +135,7 @@ describe("vercel-drain", () => {
         origin: "https://acme.example.com",
         path: "/docs/quickstart",
         route: "/docs/[slug]",
-        queryParams: "utm_source=x&utm_campaign=launch&tenant=acme&api_key=leak_me",
+        queryParams: "utm_source=x&utm_campaign=launch&tenant=acme",
         referrer: "https://t.co/xyz?secret=1",
         country: "US",
         region: "CA",
@@ -180,8 +180,6 @@ describe("vercel-drain", () => {
         SCOPEDB_ENDPOINT: "https://workspace.scopedb.cloud",
         SCOPEDB_API_KEY: "test-api-key",
         VERCEL_DRAIN_SECRET: "drain-signing-secret",
-        SCOPEDB_ALLOWED_QUERY_PARAMS: "tenant",
-        SCOPEDB_REDACT_PATH_PREFIXES: "/reset-password",
       },
     );
 
@@ -210,7 +208,7 @@ describe("vercel-drain", () => {
     assert.equal(reqRow["level"], "error");
     assert.equal(reqRow["method"], "POST");
     assert.equal(reqRow["host"], "acme.example.com");
-    assert.equal(reqRow["path"], "/reset-password/:redacted");
+    assert.equal(reqRow["path"], "/api/chat");
     assert.equal(reqRow["status"], 504);
     assert.equal(reqRow["request_id"], "iad1::sfo1::12345");
 
@@ -220,7 +218,12 @@ describe("vercel-drain", () => {
     assert.equal(reqAttrs["utm_source"], "github");
     assert.equal(reqAttrs["utm_medium"], "readme");
     assert.equal(reqAttrs["ref"], "oss");
-    assert.deepEqual(reqAttrs["query"], { tenant: "acme" });
+    assert.deepEqual(reqAttrs["query"], {
+      utm_source: "github",
+      utm_medium: "readme",
+      ref: "oss",
+      tenant: "acme",
+    });
     assert.equal(reqAttrs["referer_host"], "github.com");
     assert.equal(reqAttrs["referer_path"], "/scopedb/vercel-drain");
     assert.equal(reqAttrs["vercel_cache"], "MISS");
@@ -234,17 +237,19 @@ describe("vercel-drain", () => {
     const pvAttrs = pageviewRow["attributes"] as Record<string, unknown>;
     assert.equal(pvAttrs["utm_source"], "x");
     assert.equal(pvAttrs["utm_campaign"], "launch");
-    assert.deepEqual(pvAttrs["query"], { tenant: "acme" });
+    assert.deepEqual(pvAttrs["query"], {
+      utm_source: "x",
+      utm_campaign: "launch",
+      tenant: "acme",
+    });
     assert.equal(pvAttrs["country"], "US");
 
     assert.equal(vitalRow["event_type"], "vercel.web_vital");
     assert.equal(vitalRow["message"], "LCP 1840.5 (good)");
 
     const serialized = JSON.stringify(batch.rows);
-    assert.ok(!serialized.includes("secret_reset_token_999"));
-    assert.ok(!serialized.includes("top_secret"));
-    assert.ok(!serialized.includes("leak_me"));
     assert.ok(!serialized.includes("token=private"));
+    assert.ok(!serialized.includes("secret=1"));
   });
 
   it("validates Catalog YAML table and view definitions against the ScopeDB SDK and emitted row columns", async () => {

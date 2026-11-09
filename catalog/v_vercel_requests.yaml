@@ -44,6 +44,7 @@ statement: |
       attributes['user_agent']::string AS user_agent,
       attributes['referer_host']::string AS referer_host,
       attributes['referer_path']::string AS referer_path,
+      attributes['query'] AS query,
       attributes['utm_source']::string AS utm_source,
       attributes['utm_medium']::string AS utm_medium,
       attributes['utm_campaign']::string AS utm_campaign,

@@ -25,8 +25,6 @@ export interface Env {
   SCOPEDB_DATABASE?: string;
   SCOPEDB_SCHEMA?: string;
   SCOPEDB_TABLE?: string;
-  SCOPEDB_ALLOWED_QUERY_PARAMS?: string;
-  SCOPEDB_REDACT_PATH_PREFIXES?: string;
 }
 
 export type VercelEventType =
@@ -52,13 +50,7 @@ export interface VercelEventRow extends Record<string, unknown> {
   attributes: Record<string, unknown>;
 }
 
-export interface NormalizationOptions {
-  readonly allowedQueryParams?: readonly string[];
-  readonly redactPathPrefixes?: readonly string[];
-  readonly sanitizePath?: (pathname: string) => string;
-}
-
-export interface VercelDrainOptions extends NormalizationOptions {
+export interface VercelDrainOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly shouldRecord?: (row: VercelEventRow, rawItem: Readonly<Record<string, unknown>>) => boolean;
 }
@@ -177,10 +169,9 @@ export function createVercelDrainHandler(options: VercelDrainOptions = {}) {
         );
       }
 
-      const normOptions = resolveNormalizationOptions(env, options);
       const rows: VercelEventRow[] = [];
       for (const item of items) {
-        for (const row of drainItemToRows(item, normOptions)) {
+        for (const row of drainItemToRows(item)) {
           if (options.shouldRecord === undefined || options.shouldRecord(row, item)) {
             rows.push(row);
           }
@@ -291,28 +282,25 @@ export function parseDrainPayload(rawText: string): Record<string, unknown>[] {
 
 export function drainItemsToRows(
   items: readonly Readonly<Record<string, unknown>>[],
-  options: NormalizationOptions = {},
 ): VercelEventRow[] {
-  return items.flatMap((item) => drainItemToRows(item, options));
+  return items.flatMap((item) => drainItemToRows(item));
 }
 
 export function drainItemToRows(
   item: Readonly<Record<string, unknown>>,
-  options: NormalizationOptions = {},
 ): VercelEventRow[] {
   const schema = stringField(item["schema"]);
   if (schema?.startsWith("vercel.analytics.") === true || (item["eventType"] === "pageview" || item["eventType"] === "event")) {
-    return [analyticsItemToRow(item, options)];
+    return [analyticsItemToRow(item)];
   }
   if (schema?.startsWith("vercel.speed_insights.") === true || typeof item["metricType"] === "string") {
-    return [speedInsightsItemToRow(item, options)];
+    return [speedInsightsItemToRow(item)];
   }
-  return logDrainItemToRows(item, options);
+  return logDrainItemToRows(item);
 }
 
 function logDrainItemToRows(
   item: Readonly<Record<string, unknown>>,
-  options: NormalizationOptions,
 ): VercelEventRow[] {
   const proxy = isPlainObject(item["proxy"]) ? item["proxy"] : undefined;
   const occurredAt = formatTimestamp(item["timestamp"] ?? proxy?.["timestamp"]);
@@ -325,10 +313,9 @@ function logDrainItemToRows(
   const method = nonEmptyString(proxy?.["method"]) ?? nonEmptyString(item["method"]);
   const rawHost = nonEmptyString(proxy?.["host"]) ?? nonEmptyString(item["host"]);
   const rawPath = nonEmptyString(proxy?.["path"]) ?? nonEmptyString(item["path"]);
-  const parsedTarget = extractUrlOrPathMetadata(rawHost, rawPath, undefined, options);
+  const parsedTarget = extractUrlOrPathMetadata(rawHost, rawPath, undefined);
   const referer = extractUrlMetadata(
     nonEmptyString(proxy?.["referer"]) ?? nonEmptyString(item["referer"]) ?? undefined,
-    options,
   );
   const status = safeHttpStatus(proxy?.["statusCode"] ?? item["statusCode"]);
   const requestId = nonEmptyString(item["requestId"]) ?? nonEmptyString(item["id"]);
@@ -363,13 +350,13 @@ function logDrainItemToRows(
     user_agent: userAgent,
     referer_host: referer.host,
     referer_path: referer.path,
+    query: parsedTarget.query,
     utm_source: parsedTarget.attribution.utm_source,
     utm_medium: parsedTarget.attribution.utm_medium,
     utm_campaign: parsedTarget.attribution.utm_campaign,
     utm_term: parsedTarget.attribution.utm_term,
     utm_content: parsedTarget.attribution.utm_content,
     ref: parsedTarget.attribution.ref,
-    ...(Object.keys(parsedTarget.customQuery).length > 0 ? { query: parsedTarget.customQuery } : {}),
   };
 
   const rows: VercelEventRow[] = [];
@@ -422,7 +409,6 @@ function logDrainItemToRows(
 
 function analyticsItemToRow(
   item: Readonly<Record<string, unknown>>,
-  options: NormalizationOptions,
 ): VercelEventRow {
   const occurredAt = formatTimestamp(item["timestamp"]);
   const service =
@@ -437,8 +423,8 @@ function analyticsItemToRow(
   const origin = nonEmptyString(item["origin"]) ?? nonEmptyString(item["vercelUrl"]);
   const rawPath = nonEmptyString(item["path"]);
   const rawQueryParams = nonEmptyString(item["queryParams"]);
-  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, rawQueryParams ?? undefined, options);
-  const referer = extractUrlMetadata(nonEmptyString(item["referrer"]) ?? undefined, options);
+  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, rawQueryParams ?? undefined);
+  const referer = extractUrlMetadata(nonEmptyString(item["referrer"]) ?? undefined);
 
   return {
     event_id: crypto.randomUUID(),
@@ -473,20 +459,19 @@ function analyticsItemToRow(
       client_version: nonEmptyString(item["clientVersion"]),
       referer_host: referer.host,
       referer_path: referer.path,
+      query: parsedTarget.query,
       utm_source: parsedTarget.attribution.utm_source,
       utm_medium: parsedTarget.attribution.utm_medium,
       utm_campaign: parsedTarget.attribution.utm_campaign,
       utm_term: parsedTarget.attribution.utm_term,
       utm_content: parsedTarget.attribution.utm_content,
       ref: parsedTarget.attribution.ref,
-      ...(Object.keys(parsedTarget.customQuery).length > 0 ? { query: parsedTarget.customQuery } : {}),
     },
   };
 }
 
 function speedInsightsItemToRow(
   item: Readonly<Record<string, unknown>>,
-  options: NormalizationOptions,
 ): VercelEventRow {
   const occurredAt = formatTimestamp(item["timestamp"]);
   const service =
@@ -495,7 +480,7 @@ function speedInsightsItemToRow(
     "unknown";
   const origin = nonEmptyString(item["origin"]) ?? nonEmptyString(item["vercelUrl"]);
   const rawPath = nonEmptyString(item["path"]);
-  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, undefined, options);
+  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, undefined);
   const metricType = nonEmptyString(item["metricType"]) ?? "WEB_VITAL";
   const metricValue = finiteNumber(item["value"]);
   const rating = nonEmptyString(item["rating"]);
@@ -532,7 +517,7 @@ function speedInsightsItemToRow(
   };
 }
 
-interface StandardAttribution {
+interface UrlAttribution {
   utm_source: string | null;
   utm_medium: string | null;
   utm_campaign: string | null;
@@ -541,7 +526,7 @@ interface StandardAttribution {
   ref: string | null;
 }
 
-const EMPTY_ATTRIBUTION: StandardAttribution = {
+const EMPTY_ATTRIBUTION: UrlAttribution = {
   utm_source: null,
   utm_medium: null,
   utm_campaign: null,
@@ -554,12 +539,11 @@ function extractUrlOrPathMetadata(
   rawHostOrOrigin: string | null,
   rawPathOrUrl: string | null,
   rawQueryString: string | undefined,
-  options: NormalizationOptions,
 ): {
   host: string | null;
   path: string | null;
-  attribution: StandardAttribution;
-  customQuery: Record<string, string>;
+  query: Record<string, string>;
+  attribution: UrlAttribution;
 } {
   let candidateUrl: string | undefined;
   if (rawPathOrUrl !== null && /^https?:\/\//i.test(rawPathOrUrl)) {
@@ -581,45 +565,32 @@ function extractUrlOrPathMetadata(
         : "";
     candidateUrl = `${baseOrigin}${normalizedPath}${querySuffix}`;
   }
-  const extracted = extractUrlMetadata(candidateUrl, options);
+  const extracted = extractUrlMetadata(candidateUrl);
   return {
     host: rawHostOrOrigin === null && candidateUrl?.startsWith("https://placeholder.local") === true ? null : extracted.host,
     path: rawPathOrUrl === null ? null : extracted.path,
+    query: extracted.query,
     attribution: extracted.attribution,
-    customQuery: extracted.customQuery,
   };
 }
 
 function extractUrlMetadata(
   rawUrl: string | undefined,
-  options: NormalizationOptions,
 ): {
   host: string | null;
   path: string | null;
-  attribution: StandardAttribution;
-  customQuery: Record<string, string>;
+  query: Record<string, string>;
+  attribution: UrlAttribution;
 } {
   if (typeof rawUrl !== "string" || rawUrl.length === 0) {
-    return { host: null, path: null, attribution: EMPTY_ATTRIBUTION, customQuery: {} };
+    return { host: null, path: null, query: {}, attribution: EMPTY_ATTRIBUTION };
   }
   try {
     const parsed = new URL(rawUrl);
-    const customQuery: Record<string, string> = {};
-    if (options.allowedQueryParams !== undefined) {
-      for (const rawKey of options.allowedQueryParams) {
-        const key = rawKey.trim();
-        if (key.length === 0) {
-          continue;
-        }
-        const value = boundedString(nonEmptyString(parsed.searchParams.get(key)), MAX_QUERY_PARAM_LENGTH);
-        if (value !== null) {
-          customQuery[key] = value;
-        }
-      }
-    }
     return {
       host: parsed.hostname.length > 0 ? parsed.hostname : null,
-      path: parsed.pathname.length > 0 ? applyPathSanitization(parsed.pathname, options) : null,
+      path: parsed.pathname.length > 0 ? parsed.pathname : null,
+      query: Object.fromEntries(parsed.searchParams),
       attribution: {
         utm_source: boundedString(nonEmptyString(parsed.searchParams.get("utm_source")), MAX_QUERY_PARAM_LENGTH),
         utm_medium: boundedString(nonEmptyString(parsed.searchParams.get("utm_medium")), MAX_QUERY_PARAM_LENGTH),
@@ -628,36 +599,10 @@ function extractUrlMetadata(
         utm_content: boundedString(nonEmptyString(parsed.searchParams.get("utm_content")), MAX_QUERY_PARAM_LENGTH),
         ref: boundedString(nonEmptyString(parsed.searchParams.get("ref")), MAX_QUERY_PARAM_LENGTH),
       },
-      customQuery,
     };
   } catch {
-    return { host: null, path: null, attribution: EMPTY_ATTRIBUTION, customQuery: {} };
+    return { host: null, path: null, query: {}, attribution: EMPTY_ATTRIBUTION };
   }
-}
-
-function applyPathSanitization(pathname: string, options: NormalizationOptions): string {
-  let result = pathname;
-  if (options.redactPathPrefixes !== undefined) {
-    for (const rawPrefix of options.redactPathPrefixes) {
-      const normalizedPrefix = rawPrefix.trim().replace(/\/+$/, "");
-      if (!normalizedPrefix.startsWith("/") || normalizedPrefix.length <= 1) {
-        continue;
-      }
-      const prefixWithSlash = `${normalizedPrefix}/`;
-      if (result.startsWith(prefixWithSlash)) {
-        const rest = result.slice(prefixWithSlash.length);
-        const nextSlash = rest.indexOf("/");
-        result =
-          nextSlash === -1
-            ? `${prefixWithSlash}:redacted`
-            : `${prefixWithSlash}:redacted${rest.slice(nextSlash)}`;
-      }
-    }
-  }
-  if (options.sanitizePath !== undefined) {
-    result = options.sanitizePath(result);
-  }
-  return result;
 }
 
 function extractTraceContext(traceparent: string | undefined): {
@@ -867,42 +812,7 @@ function resolveEnv(runtimeEnv?: ResolvedEnv): ResolvedEnv {
     SCOPEDB_DATABASE: runtimeEnv?.SCOPEDB_DATABASE ?? procEnv["SCOPEDB_DATABASE"],
     SCOPEDB_SCHEMA: runtimeEnv?.SCOPEDB_SCHEMA ?? procEnv["SCOPEDB_SCHEMA"],
     SCOPEDB_TABLE: runtimeEnv?.SCOPEDB_TABLE ?? procEnv["SCOPEDB_TABLE"],
-    SCOPEDB_ALLOWED_QUERY_PARAMS:
-      runtimeEnv?.SCOPEDB_ALLOWED_QUERY_PARAMS ?? procEnv["SCOPEDB_ALLOWED_QUERY_PARAMS"],
-    SCOPEDB_REDACT_PATH_PREFIXES:
-      runtimeEnv?.SCOPEDB_REDACT_PATH_PREFIXES ?? procEnv["SCOPEDB_REDACT_PATH_PREFIXES"],
   };
-}
-
-function resolveNormalizationOptions(
-  env: ResolvedEnv,
-  options: VercelDrainOptions,
-): NormalizationOptions {
-  const envQueryParams = splitCommaSeparated(env.SCOPEDB_ALLOWED_QUERY_PARAMS);
-  const envRedactPrefixes = splitCommaSeparated(env.SCOPEDB_REDACT_PATH_PREFIXES);
-  const allowedQueryParams = [
-    ...(options.allowedQueryParams ?? []),
-    ...envQueryParams,
-  ];
-  const redactPathPrefixes = [
-    ...(options.redactPathPrefixes ?? []),
-    ...envRedactPrefixes,
-  ];
-  return {
-    ...(allowedQueryParams.length > 0 ? { allowedQueryParams } : {}),
-    ...(redactPathPrefixes.length > 0 ? { redactPathPrefixes } : {}),
-    ...(options.sanitizePath !== undefined ? { sanitizePath: options.sanitizePath } : {}),
-  };
-}
-
-function splitCommaSeparated(raw: string | undefined): string[] {
-  if (typeof raw !== "string" || raw.trim().length === 0) {
-    return [];
-  }
-  return raw
-    .split(",")
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
 }
 
 function safeHttpStatus(status: unknown): number | null {

@@ -52,6 +52,7 @@ statement: |
       attributes['utm_term']::string AS utm_term,
       attributes['utm_content']::string AS utm_content,
       attributes['ref']::string AS ref,
+      attributes['query'] AS query,
       attributes['user_agent']::string AS user_agent
   WHERE path IS NOT NULL
     AND NOT starts_with(path, '/api/')
