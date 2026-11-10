@@ -13,7 +13,7 @@
 # limitations under the License.
 
 name: v_vercel_ai_bots
-comment: Vercel HTTP requests from AI crawlers, coding agents, and Markdown/llms.txt readers
+comment: AI user-agent requests and Markdown/llms.txt content access, with separate identity and content signals
 statement: |
   FROM scopedb.public.vercel_events
   WHERE event_type = 'vercel.request'
@@ -31,9 +31,10 @@ statement: |
       attributes['vercel_cache']::string AS vercel_cache,
       attributes['user_agent']::string AS user_agent,
       attributes['referer_host']::string AS referer_host
-  WHERE path = '/llms.txt'
-     OR ends_with(path, '.md')
-     OR regexp_like(
-         user_agent,
-         regex => '(?i)(ClaudeBot|Claude-Web|Claude-User|Anthropic|GPTBot|ChatGPT-User|OAI-SearchBot|Codex|Cursor|PerplexityBot|Perplexity-User|CCBot|Google-Extended|Applebot-Extended|Bytespider|Amazonbot|cohere-ai|YouBot)'
-     )
+  SELECT *,
+      if(regexp_like(
+          user_agent,
+          regex => '(?i)(ClaudeBot|Claude-Web|Claude-User|Anthropic|GPTBot|ChatGPT-User|OAI-SearchBot|Codex|Cursor|PerplexityBot|Perplexity-User|CCBot|Google-Extended|Applebot-Extended|Bytespider|Amazonbot|cohere-ai|YouBot)'
+      ), true, false) AS is_ai_user_agent,
+      if(path = '/llms.txt' OR ends_with(path, '.md'), true, false) AS is_markdown_request
+  WHERE is_ai_user_agent OR is_markdown_request

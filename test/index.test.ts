@@ -23,6 +23,7 @@ import { type CatalogTable, type CatalogView, Client } from "scopedb";
 import YAML from "yaml";
 import {
   createVercelDrainHandler,
+  drainItemToRows,
   drainItemsToRows,
   verifyVercelSignature,
 } from "../src/index.js";
@@ -72,7 +73,7 @@ describe("vercel-drain", () => {
     assert.equal(await verifyVercelSignature(rawBytes, validSig, "wrong-secret"), false);
   });
 
-  it("normalizes Log Drains, Web Analytics Drains, and Speed Insights Drains into ScopeDB rows", async () => {
+  it("normalizes Log Drains, Web Analytics Drains, and Speed Insights Drains with multi-value query capture and path token redaction", async () => {
     const ingestedBatches: { url: string; headers: Headers; rows: Record<string, unknown>[] }[] = [];
 
     const handler = createVercelDrainHandler({
@@ -115,11 +116,11 @@ describe("vercel-drain", () => {
           timestamp: 1730620800000,
           method: "POST",
           host: "acme.example.com",
-          path: "/api/chat?utm_source=github&utm_medium=readme&ref=oss&tenant=acme",
+          path: "/reset/tok_a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1?utm_source=github&utm_medium=readme&ref=oss&tenant=acme&tag=a&tag=b",
           statusCode: 504,
           region: "sfo1",
           vercelCache: "MISS",
-          referer: "https://github.com/scopedb/vercel-drain?token=private",
+          referer: "https://github.com/scopedb/vercel-drain?token=private#frag",
           userAgent: ["ClaudeBot/1.0 (+https://www.anthropic.com)"],
         },
       }),
@@ -135,7 +136,7 @@ describe("vercel-drain", () => {
         origin: "https://acme.example.com",
         path: "/docs/quickstart",
         route: "/docs/[slug]",
-        queryParams: "utm_source=x&utm_campaign=launch&tenant=acme",
+        queryParams: "utm_source=x&utm_campaign=launch&tenant=acme&plan=team&plan=free",
         referrer: "https://t.co/xyz?secret=1",
         country: "US",
         region: "CA",
@@ -208,21 +209,20 @@ describe("vercel-drain", () => {
     assert.equal(reqRow["level"], "error");
     assert.equal(reqRow["method"], "POST");
     assert.equal(reqRow["host"], "acme.example.com");
-    assert.equal(reqRow["path"], "/api/chat");
+    assert.equal(reqRow["path"], "/reset/REDACTED");
     assert.equal(reqRow["status"], 504);
     assert.equal(reqRow["request_id"], "iad1::sfo1::12345");
 
     const reqAttrs = reqRow["attributes"] as Record<string, unknown>;
     assert.equal(reqAttrs["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
     assert.equal(reqAttrs["span_id"], "00f067aa0ba902b7");
-    assert.equal(reqAttrs["utm_source"], "github");
-    assert.equal(reqAttrs["utm_medium"], "readme");
-    assert.equal(reqAttrs["ref"], "oss");
+    assert.equal("utm_source" in reqAttrs, false);
     assert.deepEqual(reqAttrs["query"], {
-      utm_source: "github",
-      utm_medium: "readme",
-      ref: "oss",
-      tenant: "acme",
+      utm_source: ["github"],
+      utm_medium: ["readme"],
+      ref: ["oss"],
+      tenant: ["acme"],
+      tag: ["a", "b"],
     });
     assert.equal(reqAttrs["referer_host"], "github.com");
     assert.equal(reqAttrs["referer_path"], "/scopedb/vercel-drain");
@@ -230,17 +230,18 @@ describe("vercel-drain", () => {
 
     assert.equal(logRow["event_type"], "vercel.log");
     assert.equal(logRow["level"], "error");
+    assert.equal(logRow["path"], "/reset/REDACTED");
     assert.equal(logRow["message"], "Unhandled rejection: upstream timeout");
 
     assert.equal(pageviewRow["event_type"], "vercel.pageview");
     assert.equal(pageviewRow["path"], "/docs/quickstart");
     const pvAttrs = pageviewRow["attributes"] as Record<string, unknown>;
-    assert.equal(pvAttrs["utm_source"], "x");
-    assert.equal(pvAttrs["utm_campaign"], "launch");
+    assert.equal("utm_source" in pvAttrs, false);
     assert.deepEqual(pvAttrs["query"], {
-      utm_source: "x",
-      utm_campaign: "launch",
-      tenant: "acme",
+      utm_source: ["x"],
+      utm_campaign: ["launch"],
+      tenant: ["acme"],
+      plan: ["team", "free"],
     });
     assert.equal(pvAttrs["country"], "US");
 
@@ -248,8 +249,162 @@ describe("vercel-drain", () => {
     assert.equal(vitalRow["message"], "LCP 1840.5 (good)");
 
     const serialized = JSON.stringify(batch.rows);
+    assert.ok(!serialized.includes("tok_a1a1a1a1"));
     assert.ok(!serialized.includes("token=private"));
     assert.ok(!serialized.includes("secret=1"));
+  });
+
+  it("preserves decoded query values and duplicates without silently clipping user data", () => {
+    const params = new URLSearchParams();
+    for (let i = 0; i < 40; i++) params.append("tag", `value-${i}`);
+    params.append("utm_source", "first");
+    params.append("utm_source", "last");
+    params.append("payload", "x".repeat(4096));
+    params.append("email", "alice@example.com");
+    params.append("token", "tok_" + "ab12".repeat(16));
+    params.append("__proto__", "ordinary query key");
+    params.append("empty", "");
+
+    const [row] = drainItemToRows({
+      id: "1",
+      projectName: "acme-web",
+      proxy: {
+        method: "GET",
+        host: "example.com",
+        path: `/?${params}`,
+        statusCode: 200,
+      },
+    });
+    assert.deepEqual(
+      row!.attributes["query"],
+      Object.fromEntries([...new Set(params.keys())].map((key) => [key, params.getAll(key)])),
+    );
+  });
+
+  it("redacts encoded and prefixed path credentials in requests and Referer headers", () => {
+    for (const token of [
+      "ab12".repeat(16),
+      "tok_" + "ab12".repeat(16),
+      "tok_12345678-abcd-1234-abcd-123456789abc",
+      "AbCd12EfGh34IjKl56MnOp",
+      "4111-1111-1111-1111",
+    ]) {
+      const encoded = [...token].map((char) => `%${char.charCodeAt(0).toString(16)}`).join("");
+      const rows = drainItemToRows({
+        id: "1",
+        projectName: "acme-web",
+        source: "lambda",
+        level: "error",
+        message: "request failed",
+        proxy: {
+          method: "GET",
+          host: "example.com",
+          path: `/reset/${encoded}`,
+          statusCode: 500,
+          referer: `https://example.com/reset/${token}?secret=hidden`,
+        },
+      });
+      assert.ok(rows.every((row) => row.path === "/reset/REDACTED"));
+      assert.equal(rows[0]!.attributes["referer_path"], "/reset/REDACTED");
+      assert.ok(!JSON.stringify(rows).includes(token));
+    }
+  });
+
+  it("applies optional URL capture policy before sending records", async () => {
+    const handler = createVercelDrainHandler({
+      allowedQueryParams: ["tag", "code"],
+      redactQueryValue: (key, value) => (key === "code" ? null : value.toUpperCase()),
+      redactPath: (path) => (path.startsWith("/reset/") ? "/reset/:token" : path),
+      fetch: async (_input, init) => {
+        const rows = gunzipSync(init!.body as Uint8Array)
+          .toString()
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        assert.deepEqual(rows[0].attributes.query, { tag: ["A", "B"] });
+        assert.equal(rows[0].path, "/reset/:token");
+        assert.equal(rows[0].attributes.referer_path, "/reset/:token");
+        assert.ok(!JSON.stringify(rows).includes("short-secret"));
+        return Response.json({ num_rows_inserted: rows.length });
+      },
+    });
+
+    const payload = JSON.stringify({
+      id: "1",
+      projectName: "acme-web",
+      proxy: {
+        method: "GET",
+        host: "example.com",
+        path: "/reset/short-secret?tag=a&tag=b&code=short-secret&email=alice%40example.com",
+        statusCode: 200,
+        referer: "https://example.com/reset/short-secret",
+      },
+    });
+    const res = await handler.fetch(
+      new Request("https://drain.example.com/api/vercel-drain", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-ndjson",
+          "x-vercel-signature": signPayload(payload, "drain-signing-secret"),
+        },
+        body: payload,
+      }),
+      {
+        SCOPEDB_ENDPOINT: "https://example.invalid",
+        SCOPEDB_API_KEY: "test",
+        VERCEL_DRAIN_SECRET: "drain-signing-secret",
+      },
+    );
+    assert.equal(res.status, 200);
+
+    const [omitted] = drainItemToRows(
+      {
+        id: "2",
+        projectName: "acme-web",
+        proxy: {
+          method: "GET",
+          host: "example.com",
+          path: "/reset/short-secret?tag=a",
+          statusCode: 200,
+        },
+      },
+      {
+        allowedQueryParams: [],
+        redactPath: () => null,
+      },
+    );
+    assert.equal(omitted!.path, null);
+    assert.deepEqual(omitted!.attributes["query"], {});
+  });
+
+  it("reports uncertain delivery without replaying a possibly committed batch", async () => {
+    let calls = 0;
+    const handler = createVercelDrainHandler({
+      fetch: async () => {
+        calls++;
+        throw new TypeError("connection lost");
+      },
+    });
+    const payload = JSON.stringify({
+      id: "1",
+      projectName: "acme-web",
+      proxy: { method: "GET", host: "example.com", path: "/", statusCode: 200 },
+    });
+    await assert.rejects(
+      handler.fetch(
+        new Request("https://drain.example.com/api/vercel-drain", {
+          method: "POST",
+          headers: { "x-vercel-signature": signPayload(payload, "drain-signing-secret") },
+          body: payload,
+        }),
+        {
+          SCOPEDB_ENDPOINT: "https://example.invalid",
+          SCOPEDB_API_KEY: "test",
+          VERCEL_DRAIN_SECRET: "drain-signing-secret",
+        },
+      ),
+    );
+    assert.equal(calls, 1);
   });
 
   it("validates Catalog YAML table and view definitions against the ScopeDB SDK and emitted row columns", async () => {

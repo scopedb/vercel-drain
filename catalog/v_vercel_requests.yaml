@@ -45,9 +45,9 @@ statement: |
       attributes['referer_host']::string AS referer_host,
       attributes['referer_path']::string AS referer_path,
       attributes['query'] AS query,
-      attributes['utm_source']::string AS utm_source,
-      attributes['utm_medium']::string AS utm_medium,
-      attributes['utm_campaign']::string AS utm_campaign,
-      attributes['utm_term']::string AS utm_term,
-      attributes['utm_content']::string AS utm_content,
-      attributes['ref']::string AS ref
+      if(attributes['query'] IS NULL, attributes['utm_source']::string, attributes['query']['utm_source'][0]::string) AS utm_source,
+      if(attributes['query'] IS NULL, attributes['utm_medium']::string, attributes['query']['utm_medium'][0]::string) AS utm_medium,
+      if(attributes['query'] IS NULL, attributes['utm_campaign']::string, attributes['query']['utm_campaign'][0]::string) AS utm_campaign,
+      if(attributes['query'] IS NULL, attributes['utm_term']::string, attributes['query']['utm_term'][0]::string) AS utm_term,
+      if(attributes['query'] IS NULL, attributes['utm_content']::string, attributes['query']['utm_content'][0]::string) AS utm_content,
+      if(attributes['query'] IS NULL, attributes['ref']::string, attributes['query']['ref'][0]::string) AS ref

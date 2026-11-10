@@ -13,7 +13,7 @@
 # limitations under the License.
 
 name: v_vercel_pageviews
-comment: Browser pageview analytics across Vercel Web Analytics Drains and HTTP Log Drains excluding API routes, static assets, and crawlers
+comment: Client-reported Web Analytics pageviews (vercel.pageview) and successful HTTP GET document requests (vercel.request); filter by event_type to avoid double-counting when both Drains are enabled
 statement: |
   FROM scopedb.public.vercel_events
   WHERE event_type = 'vercel.pageview'
@@ -24,6 +24,7 @@ statement: |
       event_type,
       host,
       path,
+      status,
       attributes['route']::string AS route,
       attributes['environment']::string AS environment,
       attributes['country']::string AS country,
@@ -46,18 +47,20 @@ statement: |
           NULL,
           attributes['referer_path']::string
       ) AS referer_path,
-      attributes['utm_source']::string AS utm_source,
-      attributes['utm_medium']::string AS utm_medium,
-      attributes['utm_campaign']::string AS utm_campaign,
-      attributes['utm_term']::string AS utm_term,
-      attributes['utm_content']::string AS utm_content,
-      attributes['ref']::string AS ref,
+      if(attributes['query'] IS NULL, attributes['utm_source']::string, attributes['query']['utm_source'][0]::string) AS utm_source,
+      if(attributes['query'] IS NULL, attributes['utm_medium']::string, attributes['query']['utm_medium'][0]::string) AS utm_medium,
+      if(attributes['query'] IS NULL, attributes['utm_campaign']::string, attributes['query']['utm_campaign'][0]::string) AS utm_campaign,
+      if(attributes['query'] IS NULL, attributes['utm_term']::string, attributes['query']['utm_term'][0]::string) AS utm_term,
+      if(attributes['query'] IS NULL, attributes['utm_content']::string, attributes['query']['utm_content'][0]::string) AS utm_content,
+      if(attributes['query'] IS NULL, attributes['ref']::string, attributes['query']['ref'][0]::string) AS ref,
       attributes['query'] AS query,
       attributes['user_agent']::string AS user_agent
   WHERE path IS NOT NULL
     AND NOT starts_with(path, '/api/')
     AND NOT starts_with(path, '/_next/')
     AND NOT starts_with(path, '/_vercel/')
+    AND NOT starts_with(path, '/_app/')
     AND NOT starts_with(path, '/.')
+    AND NOT ends_with(path, '/__data.json')
     AND NOT regexp_like(path, regex => '(?i)[.](md|txt|xml|ico|svg|png|jpg|jpeg|webp|gif|css|js|map|json|woff2?)$')
-    AND (user_agent IS NULL OR NOT regexp_like(user_agent, regex => '(?i)(bot|crawler|spider|slurp|facebookexternalhit|feedbin|pingwatch|uptime|statuscake|cortex-xpanse|paloaltonetworks|censys|shodan|zgrab|curl|wget|python|go-http-client|axios|node-fetch|undici|okhttp|headless|Claude-User|Cursor|Codex)'))
+    AND (user_agent IS NULL OR NOT regexp_like(user_agent, regex => '(?i)(bot|crawler|spider|slurp|facebookexternalhit|feedbin|pingwatch|uptime|statuscake|cortex-xpanse|paloaltonetworks|censys|shodan|zgrab|curl|wget|python|go-http-client|axios|node-fetch|undici|okhttp|headless|Claude-User|ChatGPT-User|Perplexity-User|Anthropic|cohere-ai|Cursor|Codex)'))

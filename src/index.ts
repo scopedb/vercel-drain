@@ -50,7 +50,16 @@ export interface VercelEventRow extends Record<string, unknown> {
   attributes: Record<string, unknown>;
 }
 
-export interface VercelDrainOptions {
+export interface UrlCaptureOptions {
+  /** Capture only these query keys. By default all keys are captured; [] disables query capture. */
+  readonly allowedQueryParams?: readonly string[];
+  /** Applied to each decoded query value. Return null to omit that value. */
+  readonly redactQueryValue?: (key: string, value: string) => string | null;
+  /** Applied to request and Referer pathnames before token redaction. Return null to omit a path. */
+  readonly redactPath?: (pathname: string, hostname: string) => string | null;
+}
+
+export interface VercelDrainOptions extends UrlCaptureOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly shouldRecord?: (row: VercelEventRow, rawItem: Readonly<Record<string, unknown>>) => boolean;
 }
@@ -63,7 +72,8 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_SANITIZE_DEPTH = 8;
 const MAX_USER_AGENT_LENGTH = 512;
 const MAX_MESSAGE_LENGTH = 2048;
-const MAX_QUERY_PARAM_LENGTH = 128;
+const MAX_STACK_LENGTH = 8192;
+const MAX_PATH_LENGTH = 2048;
 const MIN_INT64 = BigInt("-9223372036854775808");
 const MAX_INT64 = BigInt("9223372036854775807");
 
@@ -171,7 +181,7 @@ export function createVercelDrainHandler(options: VercelDrainOptions = {}) {
 
       const rows: VercelEventRow[] = [];
       for (const item of items) {
-        for (const row of drainItemToRows(item)) {
+        for (const row of drainItemToRows(item, options)) {
           if (options.shouldRecord === undefined || options.shouldRecord(row, item)) {
             rows.push(row);
           }
@@ -203,8 +213,11 @@ export function createVercelDrainHandler(options: VercelDrainOptions = {}) {
         .maxRetries(2)
         .build();
 
-      await stream.sendAll(rows);
-      await stream.shutdown();
+      try {
+        await stream.sendAll(rows);
+      } finally {
+        await stream.shutdown();
+      }
 
       return Response.json(
         { num_rows_inserted: rows.length },
@@ -282,25 +295,28 @@ export function parseDrainPayload(rawText: string): Record<string, unknown>[] {
 
 export function drainItemsToRows(
   items: readonly Readonly<Record<string, unknown>>[],
+  options: UrlCaptureOptions = {},
 ): VercelEventRow[] {
-  return items.flatMap((item) => drainItemToRows(item));
+  return items.flatMap((item) => drainItemToRows(item, options));
 }
 
 export function drainItemToRows(
   item: Readonly<Record<string, unknown>>,
+  options: UrlCaptureOptions = {},
 ): VercelEventRow[] {
   const schema = stringField(item["schema"]);
   if (schema?.startsWith("vercel.analytics.") === true || (item["eventType"] === "pageview" || item["eventType"] === "event")) {
-    return [analyticsItemToRow(item)];
+    return [analyticsItemToRow(item, options)];
   }
   if (schema?.startsWith("vercel.speed_insights.") === true || typeof item["metricType"] === "string") {
-    return [speedInsightsItemToRow(item)];
+    return [speedInsightsItemToRow(item, options)];
   }
-  return logDrainItemToRows(item);
+  return logDrainItemToRows(item, options);
 }
 
 function logDrainItemToRows(
   item: Readonly<Record<string, unknown>>,
+  options: UrlCaptureOptions,
 ): VercelEventRow[] {
   const proxy = isPlainObject(item["proxy"]) ? item["proxy"] : undefined;
   const occurredAt = formatTimestamp(item["timestamp"] ?? proxy?.["timestamp"]);
@@ -313,9 +329,11 @@ function logDrainItemToRows(
   const method = nonEmptyString(proxy?.["method"]) ?? nonEmptyString(item["method"]);
   const rawHost = nonEmptyString(proxy?.["host"]) ?? nonEmptyString(item["host"]);
   const rawPath = nonEmptyString(proxy?.["path"]) ?? nonEmptyString(item["path"]);
-  const parsedTarget = extractUrlOrPathMetadata(rawHost, rawPath, undefined);
+  const parsedTarget = extractUrlOrPathMetadata(rawHost, rawPath, undefined, options, true);
   const referer = extractUrlMetadata(
     nonEmptyString(proxy?.["referer"]) ?? nonEmptyString(item["referer"]) ?? undefined,
+    options,
+    false,
   );
   const status = safeHttpStatus(proxy?.["statusCode"] ?? item["statusCode"]);
   const requestId = nonEmptyString(item["requestId"]) ?? nonEmptyString(item["id"]);
@@ -351,12 +369,6 @@ function logDrainItemToRows(
     referer_host: referer.host,
     referer_path: referer.path,
     query: parsedTarget.query,
-    utm_source: parsedTarget.attribution.utm_source,
-    utm_medium: parsedTarget.attribution.utm_medium,
-    utm_campaign: parsedTarget.attribution.utm_campaign,
-    utm_term: parsedTarget.attribution.utm_term,
-    utm_content: parsedTarget.attribution.utm_content,
-    ref: parsedTarget.attribution.ref,
   };
 
   const rows: VercelEventRow[] = [];
@@ -409,6 +421,7 @@ function logDrainItemToRows(
 
 function analyticsItemToRow(
   item: Readonly<Record<string, unknown>>,
+  options: UrlCaptureOptions,
 ): VercelEventRow {
   const occurredAt = formatTimestamp(item["timestamp"]);
   const service =
@@ -423,8 +436,8 @@ function analyticsItemToRow(
   const origin = nonEmptyString(item["origin"]) ?? nonEmptyString(item["vercelUrl"]);
   const rawPath = nonEmptyString(item["path"]);
   const rawQueryParams = nonEmptyString(item["queryParams"]);
-  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, rawQueryParams ?? undefined);
-  const referer = extractUrlMetadata(nonEmptyString(item["referrer"]) ?? undefined);
+  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, rawQueryParams ?? undefined, options, true);
+  const referer = extractUrlMetadata(nonEmptyString(item["referrer"]) ?? undefined, options, false);
 
   return {
     event_id: crypto.randomUUID(),
@@ -460,18 +473,13 @@ function analyticsItemToRow(
       referer_host: referer.host,
       referer_path: referer.path,
       query: parsedTarget.query,
-      utm_source: parsedTarget.attribution.utm_source,
-      utm_medium: parsedTarget.attribution.utm_medium,
-      utm_campaign: parsedTarget.attribution.utm_campaign,
-      utm_term: parsedTarget.attribution.utm_term,
-      utm_content: parsedTarget.attribution.utm_content,
-      ref: parsedTarget.attribution.ref,
     },
   };
 }
 
 function speedInsightsItemToRow(
   item: Readonly<Record<string, unknown>>,
+  options: UrlCaptureOptions,
 ): VercelEventRow {
   const occurredAt = formatTimestamp(item["timestamp"]);
   const service =
@@ -480,7 +488,7 @@ function speedInsightsItemToRow(
     "unknown";
   const origin = nonEmptyString(item["origin"]) ?? nonEmptyString(item["vercelUrl"]);
   const rawPath = nonEmptyString(item["path"]);
-  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, undefined);
+  const parsedTarget = extractUrlOrPathMetadata(origin, rawPath, undefined, options, false);
   const metricType = nonEmptyString(item["metricType"]) ?? "WEB_VITAL";
   const metricValue = finiteNumber(item["value"]);
   const rating = nonEmptyString(item["rating"]);
@@ -517,37 +525,22 @@ function speedInsightsItemToRow(
   };
 }
 
-interface UrlAttribution {
-  utm_source: string | null;
-  utm_medium: string | null;
-  utm_campaign: string | null;
-  utm_term: string | null;
-  utm_content: string | null;
-  ref: string | null;
-}
-
-const EMPTY_ATTRIBUTION: UrlAttribution = {
-  utm_source: null,
-  utm_medium: null,
-  utm_campaign: null,
-  utm_term: null,
-  utm_content: null,
-  ref: null,
-};
-
 function extractUrlOrPathMetadata(
   rawHostOrOrigin: string | null,
   rawPathOrUrl: string | null,
   rawQueryString: string | undefined,
+  options: UrlCaptureOptions,
+  captureQuery = true,
 ): {
   host: string | null;
   path: string | null;
-  query: Record<string, string>;
-  attribution: UrlAttribution;
+  query: Record<string, string[]>;
 } {
   let candidateUrl: string | undefined;
+  let hasExplicitHost = rawHostOrOrigin !== null;
   if (rawPathOrUrl !== null && /^https?:\/\//i.test(rawPathOrUrl)) {
     candidateUrl = rawPathOrUrl;
+    hasExplicitHost = true;
   } else {
     const baseOrigin =
       rawHostOrOrigin !== null
@@ -565,44 +558,83 @@ function extractUrlOrPathMetadata(
         : "";
     candidateUrl = `${baseOrigin}${normalizedPath}${querySuffix}`;
   }
-  const extracted = extractUrlMetadata(candidateUrl);
+  const extracted = extractUrlMetadata(candidateUrl, options, captureQuery, hasExplicitHost);
   return {
-    host: rawHostOrOrigin === null && candidateUrl?.startsWith("https://placeholder.local") === true ? null : extracted.host,
+    host: hasExplicitHost ? extracted.host : null,
     path: rawPathOrUrl === null ? null : extracted.path,
     query: extracted.query,
-    attribution: extracted.attribution,
   };
 }
 
 function extractUrlMetadata(
   rawUrl: string | undefined,
+  options: UrlCaptureOptions,
+  captureQuery = true,
+  hasExplicitHost = true,
 ): {
   host: string | null;
   path: string | null;
-  query: Record<string, string>;
-  attribution: UrlAttribution;
+  query: Record<string, string[]>;
 } {
-  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
-    return { host: null, path: null, query: {}, attribution: EMPTY_ATTRIBUTION };
-  }
+  const empty = { host: null, path: null, query: {} };
+  if (!rawUrl) return empty;
+  let parsed: URL;
   try {
-    const parsed = new URL(rawUrl);
-    return {
-      host: parsed.hostname.length > 0 ? parsed.hostname : null,
-      path: parsed.pathname.length > 0 ? parsed.pathname : null,
-      query: Object.fromEntries(parsed.searchParams),
-      attribution: {
-        utm_source: boundedString(nonEmptyString(parsed.searchParams.get("utm_source")), MAX_QUERY_PARAM_LENGTH),
-        utm_medium: boundedString(nonEmptyString(parsed.searchParams.get("utm_medium")), MAX_QUERY_PARAM_LENGTH),
-        utm_campaign: boundedString(nonEmptyString(parsed.searchParams.get("utm_campaign")), MAX_QUERY_PARAM_LENGTH),
-        utm_term: boundedString(nonEmptyString(parsed.searchParams.get("utm_term")), MAX_QUERY_PARAM_LENGTH),
-        utm_content: boundedString(nonEmptyString(parsed.searchParams.get("utm_content")), MAX_QUERY_PARAM_LENGTH),
-        ref: boundedString(nonEmptyString(parsed.searchParams.get("ref")), MAX_QUERY_PARAM_LENGTH),
-      },
-    };
+    parsed = new URL(rawUrl);
   } catch {
-    return { host: null, path: null, query: {}, attribution: EMPTY_ATTRIBUTION };
+    return empty;
   }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return empty;
+
+  const effectiveHostname = hasExplicitHost ? parsed.hostname : "";
+  const pathname = options.redactPath ? options.redactPath(parsed.pathname, effectiveHostname) : parsed.pathname;
+  const path = pathname === null ? null : boundedString(pathname.split("/").map((segment) => {
+    try {
+      // Inspect decoded data before truncation, including Referer paths and raw Vercel Log Drain paths.
+      const decoded = decodeURIComponent(segment);
+      return redactTokens(decoded) === decoded ? segment : "REDACTED";
+    } catch {
+      return "REDACTED";
+    }
+  }).join("/"), MAX_PATH_LENGTH);
+
+  if (!captureQuery) return { host: parsed.hostname, path, query: {} };
+  const allowed = options.allowedQueryParams === undefined ? null : new Set(options.allowedQueryParams);
+  const query = new Map<string, string[]>();
+  for (const [key, value] of parsed.searchParams) {
+    if (allowed !== null && !allowed.has(key)) continue;
+    const captured = options.redactQueryValue ? options.redactQueryValue(key, value) : value;
+    if (captured === null) continue;
+    const values = query.get(key) ?? [];
+    values.push(captured);
+    query.set(key, values);
+  }
+  return { host: parsed.hostname, path, query: Object.fromEntries(query) };
+}
+
+// Defense in depth only: short secrets and personal data require an application capture policy.
+function redactTokens(value: string): string {
+  return value.replace(/[a-zA-Z0-9+_-]+/g, (token) => {
+    // Prefixes such as tok_ can hide an otherwise recognizable hex identifier.
+    return isSensitiveToken(token)
+      || isSensitiveToken(token.replace(/^[a-zA-Z]+[_-]/, ""))
+      || token.split(/[_-]/).some(isSensitiveToken) ? "REDACTED" : token;
+  });
+}
+
+function isSensitiveToken(token: string): boolean {
+  const compact = token.replace(/[+_-]/g, "");
+  if (/^[a-fA-F0-9]{32,}$/.test(compact)) return true;
+  if (token.length >= 21 && (token.match(/[A-Z]/g)?.length ?? 0) >= 2
+    && (token.match(/[a-z]/g)?.length ?? 0) >= 2 && (token.match(/[0-9]/g)?.length ?? 0) >= 2) return true;
+  if (!/^\d{13,19}$/.test(compact)) return false;
+  let sum = 0;
+  for (let i = compact.length - 1; i >= 0; i--) {
+    let digit = Number(compact[i]);
+    if ((compact.length - 1 - i) % 2 === 1) digit *= 2;
+    sum += digit > 9 ? digit - 9 : digit;
+  }
+  return sum % 10 === 0;
 }
 
 function extractTraceContext(traceparent: string | undefined): {
@@ -878,7 +910,7 @@ function sanitizeValue(value: unknown, depth: number, ancestors: Set<object>): u
     return {
       name: value.name,
       message: value.message,
-      ...(typeof value.stack === "string" ? { stack: value.stack } : {}),
+      ...(typeof value.stack === "string" ? { stack: boundedString(value.stack, MAX_STACK_LENGTH) } : {}),
     };
   }
   if (ancestors.has(value)) {

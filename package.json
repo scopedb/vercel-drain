@@ -17,7 +17,8 @@
     "build:test": "node -e \"require('node:fs').rmSync('dist-test', { recursive: true, force: true })\" && tsc -p tsconfig.test.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build:test && node --test dist-test/test/*.test.js",
-    "ci": "pnpm test && pnpm run check"
+    "ci": "pnpm test && pnpm run check",
+    "test:catalog": "pnpm run build:test && node --test dist-test/test/catalog.integration.js"
   },
   "dependencies": {
     "scopedb": "^0.4.0"
