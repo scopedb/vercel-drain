@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { Client } from "scopedb";
+import { Client, encodeAppendRecord } from "scopedb";
 
 export interface Env {
   SCOPEDB_ENDPOINT: string;
@@ -62,6 +62,38 @@ export interface UrlCaptureOptions {
 export interface VercelDrainOptions extends UrlCaptureOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly shouldRecord?: (row: VercelEventRow, rawItem: Readonly<Record<string, unknown>>) => boolean;
+  /**
+   * Drop incoming drain rows matching the receiver's own host and pathname so
+   * mounting `/api/vercel-drain` inside a drained Next.js app cannot loop.
+   * Defaults to `true`.
+   */
+  readonly ignoreSelfRequests?: boolean;
+}
+
+export interface VercelTelemetryEventInput {
+  readonly message: string;
+  readonly request?: Request;
+  readonly eventType?: VercelEventType;
+  readonly service?: string;
+  readonly status?: number | null;
+  readonly outcome?: VercelEventRow["outcome"];
+  readonly level?: VercelEventRow["level"];
+  readonly durationMs?: number;
+  readonly error?: unknown;
+  readonly attributes?: Record<string, unknown>;
+  readonly occurredAt?: string | Date;
+  readonly eventId?: string;
+}
+
+export interface VercelTelemetryOptions {
+  readonly endpoint?: string;
+  readonly apiKey?: string;
+  readonly database?: string;
+  readonly schema?: string;
+  readonly table?: string;
+  readonly service?: string;
+  readonly fetch?: typeof globalThis.fetch;
+  readonly timeoutMs?: number;
 }
 
 const DEFAULT_DATABASE = "scopedb";
@@ -179,9 +211,34 @@ export function createVercelDrainHandler(options: VercelDrainOptions = {}) {
         );
       }
 
+      const ignoreSelf = options.ignoreSelfRequests !== false;
+      let receiverHost: string | null = null;
+      let receiverPath: string | null = null;
+      if (ignoreSelf) {
+        try {
+          const receiverUrl = new URL(request.url);
+          receiverHost = receiverUrl.hostname.toLowerCase() || null;
+          receiverPath = receiverUrl.pathname || null;
+        } catch {
+          receiverHost = null;
+          receiverPath = null;
+        }
+      }
+
       const rows: VercelEventRow[] = [];
       for (const item of items) {
         for (const row of drainItemToRows(item, options)) {
+          if (
+            ignoreSelf &&
+            receiverHost !== null &&
+            receiverPath !== null &&
+            row.host !== null &&
+            row.path !== null &&
+            row.host.toLowerCase() === receiverHost &&
+            row.path === receiverPath
+          ) {
+            continue;
+          }
           if (options.shouldRecord === undefined || options.shouldRecord(row, item)) {
             rows.push(row);
           }
@@ -230,6 +287,155 @@ export function createVercelDrainHandler(options: VercelDrainOptions = {}) {
 export function createNextRouteHandler(options: VercelDrainOptions = {}) {
   const handler = createVercelDrainHandler(options);
   return (request: Request): Promise<Response> => handler.fetch(request);
+}
+
+/**
+ * Builds a normalized 13-column `vercel_events` row for in-application telemetry
+ * (for example inside Next.js `after()` or `@vercel/functions` `waitUntil()`).
+ * Works on any Vercel plan, including Hobby, without requiring Log Drains.
+ */
+export function buildVercelEventRow(
+  input: VercelTelemetryEventInput,
+  defaultService?: string,
+): VercelEventRow {
+  const procEnv = typeof process !== "undefined" && process.env !== undefined ? process.env : {};
+  let method: string | null = null;
+  let host: string | null = null;
+  let path: string | null = null;
+  let requestId: string | null = null;
+
+  if (input.request !== undefined) {
+    method = nonEmptyString(input.request.method);
+    requestId = nonEmptyString(input.request.headers.get("x-vercel-id"));
+    try {
+      // Omit query strings so sensitive callback parameters (e.g. OAuth codes) never leak.
+      const parsed = new URL(input.request.url);
+      host = nonEmptyString(parsed.hostname);
+      path = boundedString(nonEmptyString(parsed.pathname), MAX_PATH_LENGTH);
+    } catch {
+      host = null;
+      path = null;
+    }
+  }
+
+  const status = safeHttpStatus(input.status);
+  const outcome: VercelEventRow["outcome"] =
+    input.outcome ??
+    (status === null ? "ok" : status >= 500 ? "error" : status >= 400 ? "client_error" : "ok");
+  const level: VercelEventRow["level"] =
+    input.level ?? (outcome === "error" ? "error" : outcome === "client_error" ? "warn" : "info");
+
+  const occurredAt =
+    input.occurredAt instanceof Date
+      ? input.occurredAt.toISOString()
+      : nonEmptyString(input.occurredAt) ?? new Date().toISOString();
+
+  const service =
+    nonEmptyString(input.service) ??
+    nonEmptyString(defaultService) ??
+    nonEmptyString(procEnv["VERCEL_PROJECT_NAME"]) ??
+    "vercel-app";
+
+  const attributes: Record<string, unknown> = {
+    source: "nextjs.after",
+  };
+  const vercelEnv = nonEmptyString(procEnv["VERCEL_ENV"]);
+  if (vercelEnv !== null) {
+    attributes["environment"] = vercelEnv;
+  }
+  const deploymentId = nonEmptyString(procEnv["VERCEL_DEPLOYMENT_ID"]);
+  if (deploymentId !== null) {
+    attributes["deployment_id"] = deploymentId;
+  }
+  const durationMs = finiteNumber(input.durationMs);
+  if (durationMs !== null) {
+    attributes["duration_ms"] = Math.max(0, Math.round(durationMs));
+  }
+  if (input.error !== undefined) {
+    attributes["error"] = sanitizeValue(input.error, 0, new Set());
+  }
+  if (input.attributes !== undefined) {
+    for (const [key, value] of Object.entries(input.attributes)) {
+      if (value === undefined) continue;
+      attributes[key] = sanitizeValue(value, 0, new Set());
+    }
+  }
+
+  return {
+    event_id: nonEmptyString(input.eventId) ?? crypto.randomUUID(),
+    occurred_at: occurredAt,
+    service,
+    event_type: input.eventType ?? "vercel.custom_event",
+    outcome,
+    level,
+    method,
+    host,
+    path,
+    status,
+    request_id: requestId,
+    message: boundedString(input.message, MAX_MESSAGE_LENGTH) ?? "",
+    attributes,
+  };
+}
+
+/**
+ * Lightweight serverless telemetry client for Next.js `after()` and `waitUntil()`.
+ * Uses single-shot `table.append()` with `encodeAppendRecord()` so no background timers
+ * outlive the request invocation.
+ */
+export function createVercelTelemetry(options: VercelTelemetryOptions = {}) {
+  const procEnv = typeof process !== "undefined" && process.env !== undefined ? process.env : {};
+  const database = nonEmptyString(options.database) ?? nonEmptyString(procEnv["SCOPEDB_DATABASE"]) ?? DEFAULT_DATABASE;
+  const schema = nonEmptyString(options.schema) ?? nonEmptyString(procEnv["SCOPEDB_SCHEMA"]) ?? DEFAULT_SCHEMA;
+  const tableName = nonEmptyString(options.table) ?? nonEmptyString(procEnv["SCOPEDB_TABLE"]) ?? DEFAULT_TABLE;
+  const timeoutMs = options.timeoutMs ?? 15_000;
+
+  let cachedClient: { key: string; client: Client } | null = null;
+
+  function getTable() {
+    const currentProcEnv = typeof process !== "undefined" && process.env !== undefined ? process.env : {};
+    const endpoint = requiredBinding(
+      options.endpoint ?? currentProcEnv["SCOPEDB_ENDPOINT"],
+      "SCOPEDB_ENDPOINT",
+    );
+    const apiKey = requiredBinding(
+      options.apiKey ?? currentProcEnv["SCOPEDB_API_KEY"],
+      "SCOPEDB_API_KEY",
+    );
+    const cacheKey = `${endpoint}|${apiKey}`;
+    if (cachedClient === null || cachedClient.key !== cacheKey) {
+      cachedClient = {
+        key: cacheKey,
+        client: new Client(endpoint, {
+          apiKey,
+          writeTimeoutMs: timeoutMs,
+          ...(options.fetch !== undefined ? { fetch: options.fetch } : {}),
+        }),
+      };
+    }
+    return cachedClient.client.table(tableName, { database, schema });
+  }
+
+  return {
+    buildRow(input: VercelTelemetryEventInput): VercelEventRow {
+      return buildVercelEventRow(input, options.service);
+    },
+    async record(input: VercelTelemetryEventInput): Promise<number> {
+      return this.recordAll([input]);
+    },
+    async recordAll(inputs: readonly VercelTelemetryEventInput[]): Promise<number> {
+      if (inputs.length === 0) {
+        return 0;
+      }
+      const ndjson = inputs
+        .map((input) => encodeAppendRecord(buildVercelEventRow(input, options.service)))
+        .join("\n");
+      const result = await getTable().append(ndjson, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      return result.num_rows_inserted;
+    },
+  };
 }
 
 export default createVercelDrainHandler();
