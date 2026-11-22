@@ -22,7 +22,9 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { type CatalogTable, type CatalogView, Client } from "scopedb";
 import YAML from "yaml";
 import {
+  buildVercelEventRow,
   createVercelDrainHandler,
+  createVercelTelemetry,
   drainItemToRows,
   drainItemsToRows,
   verifyVercelSignature,
@@ -473,5 +475,154 @@ describe("vercel-drain", () => {
       const viewResult = await client.catalog().view("scopedb", "public", viewName).apply(viewDef);
       assert.equal(viewResult.after?.name, viewName);
     }
+  });
+
+  it("drops self-referential drain requests by default to prevent feedback loops", async () => {
+    const ingested: Record<string, unknown>[] = [];
+    const mockFetch: typeof globalThis.fetch = async (_input, init) => {
+      const rawBody = init?.body;
+      assert.ok(rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer);
+      const decompressed = gunzipSync(
+        rawBody instanceof Uint8Array ? rawBody : new Uint8Array(rawBody),
+      ).toString("utf8");
+      const rows = decompressed
+        .trim()
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      ingested.push(...rows);
+      return Response.json({ num_rows_inserted: rows.length });
+    };
+
+    const env = {
+      SCOPEDB_ENDPOINT: "https://workspace.scopedb.cloud",
+      SCOPEDB_API_KEY: "test-api-key",
+      DRAIN_AUTH_TOKEN: "drain-token",
+    };
+
+    const payload = [
+      JSON.stringify({
+        id: "self_1",
+        projectName: "my-app",
+        source: "lambda",
+        proxy: { method: "POST", host: "app.example.com", path: "/api/vercel-drain", statusCode: 200 },
+      }),
+      JSON.stringify({
+        id: "app_1",
+        projectName: "my-app",
+        source: "lambda",
+        proxy: { method: "GET", host: "app.example.com", path: "/api/health", statusCode: 200 },
+      }),
+    ].join("\n");
+
+    const defaultHandler = createVercelDrainHandler({ fetch: mockFetch });
+    const res1 = await defaultHandler.fetch(
+      new Request("https://app.example.com/api/vercel-drain", {
+        method: "POST",
+        headers: { Authorization: "Bearer drain-token" },
+        body: payload,
+      }),
+      env,
+    );
+    assert.equal(res1.status, 200);
+    assert.equal(ingested.length, 1);
+    assert.equal(ingested[0]?.["path"], "/api/health");
+
+    ingested.length = 0;
+    const optOutHandler = createVercelDrainHandler({ fetch: mockFetch, ignoreSelfRequests: false });
+    const res2 = await optOutHandler.fetch(
+      new Request("https://app.example.com/api/vercel-drain", {
+        method: "POST",
+        headers: { Authorization: "Bearer drain-token" },
+        body: payload,
+      }),
+      env,
+    );
+    assert.equal(res2.status, 200);
+    assert.equal(ingested.length, 2);
+  });
+
+  it("builds schema-aligned telemetry rows for Next.js after() and appends strict NDJSON via scopedb 0.4", async () => {
+    const tableDef = YAML.parse(
+      await readFile(new URL("../../catalog/table.yaml", import.meta.url), "utf8"),
+    ) as CatalogTable;
+    const expectedColumns = (tableDef.columns ?? []).map((col) => col.name);
+
+    const request = new Request(
+      "https://hn-inbox.example.com/api/auth/github/callback?code=secret_code&state=secret_state",
+      {
+        method: "GET",
+        headers: { "x-vercel-id": "iad1::req123" },
+      },
+    );
+
+    const row = buildVercelEventRow(
+      {
+        request,
+        status: 500,
+        message: "schedule.poll.failed",
+        durationMs: 215.4,
+        error: new Error("upstream timeout"),
+        attributes: { attempt: 1, ignored: undefined },
+      },
+      "hn-inbox",
+    );
+
+    assert.deepEqual(Object.keys(row), expectedColumns);
+    assert.equal(row.service, "hn-inbox");
+    assert.equal(row.host, "hn-inbox.example.com");
+    assert.equal(row.path, "/api/auth/github/callback");
+    assert.equal(row.request_id, "iad1::req123");
+    assert.equal(row.outcome, "error");
+    assert.equal(row.level, "error");
+    assert.equal(row.attributes["duration_ms"], 215);
+    assert.equal("ignored" in row.attributes, false);
+    assert.equal(JSON.stringify(row).includes("secret_code"), false);
+
+    const appended: { url: string; auth: string | null; rows: Record<string, unknown>[] }[] = [];
+    const telemetry = createVercelTelemetry({
+      endpoint: "https://workspace.scopedb.cloud",
+      apiKey: "test-api-key",
+      service: "hn-inbox",
+      fetch: async (input, init) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const headers = new Headers(init?.headers);
+        const body = init?.body;
+        let text: string;
+        if (typeof body === "string") {
+          text = body;
+        } else if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+          const buf = body instanceof Uint8Array ? body : new Uint8Array(body);
+          text =
+            headers.get("content-encoding") === "gzip"
+              ? gunzipSync(buf).toString("utf8")
+              : new TextDecoder().decode(buf);
+        } else {
+          throw new Error("unexpected body type");
+        }
+        const rows = text
+          .trim()
+          .split("\n")
+          .filter((l) => l.length > 0)
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        appended.push({ url, auth: headers.get("authorization"), rows });
+        return Response.json({ num_rows_inserted: rows.length });
+      },
+    });
+
+    const inserted = await telemetry.record({
+      request,
+      status: 200,
+      message: "schedule.poll.completed",
+      durationMs: 88,
+      attributes: { stories_observed: 4 },
+    });
+
+    assert.equal(inserted, 1);
+    assert.equal(appended.length, 1);
+    assert.equal(appended[0]?.auth, "Bearer test-api-key");
+    assert.equal(appended[0]?.rows.length, 1);
+    assert.equal(appended[0]?.rows[0]?.["message"], "schedule.poll.completed");
+    assert.equal(appended[0]?.rows[0]?.["outcome"], "ok");
   });
 });

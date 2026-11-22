@@ -74,43 +74,73 @@ Configure the environment variables in your deployment:
 | `SCOPEDB_SCHEMA`       | No       | `public`        | Target schema name                                                                      |
 | `SCOPEDB_TABLE`        | No       | `vercel_events` | Target table name                                                                       |
 
-### 3. Connect Vercel Drains or Next.js `after()`
+### 3. Connect Vercel Drains (Pro / Enterprise) or Next.js `after()` (Hobby + Pro)
 
-In your Vercel dashboard, open **Team Settings > Drains**, create a Drain pointing to your `/api/vercel-drain` endpoint (`NDJSON` or `JSON`), and copy the Signing Secret into `VERCEL_DRAIN_SECRET`.
+#### Option A: Zero-code Vercel Drains (Pro / Enterprise)
 
-For in-application business or AI SDK events on any Vercel plan (including Hobby), use `scopedb` inside Next.js `after()`:
+In your Vercel dashboard, open **Team Settings > Drains**, create a Drain pointing to your `/api/vercel-drain` endpoint (`NDJSON` or `JSON`), and copy the Signing Secret into `VERCEL_DRAIN_SECRET`. By default (`ignoreSelfRequests: true`), the receiver drops incoming drain records matching its own host and pathname so mounting `/api/vercel-drain` inside a drained Next.js app cannot trigger an infinite feedback loop.
+
+#### Option B: In-application telemetry via Next.js `after()` (works on Hobby and Pro)
+
+Vercel Drains require a Pro or Enterprise plan. On any Vercel plan (including Hobby), emit structured application, cron, or AI SDK events directly into the same `scopedb.public.vercel_events` table inside Next.js `after()` using `createVercelTelemetry()`:
 
 ```ts
 import { after } from "next/server";
-import { Client } from "scopedb";
+import { createVercelTelemetry } from "vercel-drain";
+
+const telemetry = createVercelTelemetry({ service: "my-nextjs-app" });
+
+export async function POST(request: Request) {
+  const startedAt = Date.now();
+  // ... handle request ...
+  after(async () => {
+    await telemetry.record({
+      request,
+      status: 200,
+      message: "ai.completion.finished",
+      durationMs: Date.now() - startedAt,
+      attributes: { model: "claude-sonnet-4-5", tokens: 842 },
+    });
+  });
+
+  return Response.json({ ok: true });
+}
+```
+
+If you prefer calling `scopedb` (`>= 0.4.0`) directly without importing `vercel-drain`, encode a `vercel_events` row with `encodeAppendRecord()` and flush it via `table.append()`:
+
+```ts
+import { after } from "next/server";
+import { Client, encodeAppendRecord } from "scopedb";
 
 const client = new Client(process.env.SCOPEDB_ENDPOINT!, {
   apiKey: process.env.SCOPEDB_API_KEY!,
 });
-const appender = client.table("vercel_events", {
+const table = client.table("vercel_events", {
   database: "scopedb",
   schema: "public",
-}).appender();
+});
 
 export async function POST(request: Request) {
   after(async () => {
-    await appender.append([
-      {
+    const parsed = new URL(request.url);
+    await table.append(
+      encodeAppendRecord({
         event_id: crypto.randomUUID(),
         occurred_at: new Date().toISOString(),
         service: "my-nextjs-app",
         event_type: "vercel.custom_event",
         outcome: "ok",
         level: "info",
-        method: "POST",
-        host: new URL(request.url).hostname,
-        path: new URL(request.url).pathname,
+        method: request.method,
+        host: parsed.hostname,
+        path: parsed.pathname,
         status: 200,
         request_id: request.headers.get("x-vercel-id"),
         message: "ai.completion.finished",
-        attributes: { model: "claude-sonnet-4-5", tokens: 842 },
-      },
-    ]);
+        attributes: { source: "nextjs.after", model: "claude-sonnet-4-5", tokens: 842 },
+      }),
+    );
   });
 
   return Response.json({ ok: true });
